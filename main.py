@@ -5,6 +5,7 @@ import pytz
 import re
 import json
 import os
+import random
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -26,12 +27,33 @@ REPORT_ROLE_ORDER = [
 ]
 
 # --- CẤU HÌNH THỨ 7 CÁCH TUẦN ---
-ANCHOR_WORK_SATURDAY = "2024-01-24" 
+ANCHOR_WORK_SATURDAY = os.getenv("ANCHOR_WORK_SATURDAY", "2026-05-16")
+
+# --- DANH SÁCH CÂU NHẮC RANDOM ---
+DAILY_STANDUP_MESSAGES = [
+    "Đến lúc bịa xem hôm qua đã làm gì",
+    "Đến giờ tổng hợp những gì 'đáng lẽ đã làm'",
+    "Đến giờ hợp thức hóa sự bận rộn hôm qua",
+    "Hôm qua làm gì không quan trọng, kể sao cho hợp lý mới quan trọng",
+    "SELECT * FROM team_status WHERE sleepy = true;",
+    "Daily.exe is starting...",
+    "Đố nhớ hôm qua làm gì",
+    "Time to explain why task estimate was merely a suggestion",
+    "Đến giờ giải thích vì sao task 2 tiếng kéo dài 2 ngày",
+    "DAILY!",
+]
+
+DAILY_REPORT_MESSAGES = [
+    "Convert sang text đê mọi người",
+    "Nhắn phát vào đây đê mọi người",
+    "DAILY!",
+]
 
 # ================= HỆ THỐNG =================
 STATE_FILE = "bot_state.json"
 VN_TZ = pytz.timezone('Asia/Ho_Chi_Minh')
-DATE_PATTERN = r"^\s*(\d{1,2})\s*[./\-]\s*(\d{1,2})\s*$"
+# Pattern ngày: hỗ trợ "11/05", "11/05:", "11.05", "11-05" và "11/05: nội dung"
+DATE_PATTERN = r"^\s*(\d{1,2})\s*[./\-]\s*(\d{1,2})\s*:?\s*(.*)?$"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -101,7 +123,9 @@ def normalize_report(author_display_name, content):
         name = author_display_name
         start_index = 0
     else:
-        name = lines[0].title()
+        # Lấy tên từ dòng đầu (loại bỏ dấu : nếu có)
+        raw_name = lines[0].rstrip(':').strip()
+        name = raw_name.title()
         start_index = 1
     
     formatted_lines = []
@@ -111,12 +135,18 @@ def normalize_report(author_display_name, content):
         line = lines[i]
         date_match = re.match(DATE_PATTERN, line)
         if date_match:
-            d, m = date_match.groups()
-            formatted_lines.append(f"{int(d):02d}/{int(m):02d}")
+            d, m, inline_content = date_match.groups()
+            date_str = f"{int(d):02d}/{int(m):02d}"
+            formatted_lines.append(date_str)
             has_date = True
+            # Nếu có nội dung inline sau ngày (ví dụ: "12/05: fix lại auto...")
+            if inline_content and inline_content.strip():
+                clean = inline_content.strip()
+                formatted_lines.append(f"- {clean[0].upper() + clean[1:]}")
         else:
             clean = re.sub(r"^[-*+•]\s*", "", line)
-            if clean.lower() == name.lower(): 
+            # Bỏ qua dòng trùng tên
+            if clean.lower() == name.lower() or clean.lower() == name.lower() + ':':
                 continue
             if clean:
                 formatted_lines.append(f"- {clean[0].upper() + clean[1:]}")
@@ -204,21 +234,31 @@ async def daily_scheduler():
     
     state = load_state()
     if state.get("date") != today_str:
-        state = {"date": today_str, "msg_id": None, "step_830": False, "step_900": False, "step_930": False}
+        state = {"date": today_str, "msg_id": None, "step_830": False, "step_900": False, "step_930": False, "step_945": False}
         save_state(state)
 
     dev_channel = bot.get_channel(DEVELOPER_CHANNEL_ID)
     daily_channel = bot.get_channel(DAILY_CHANNEL_ID)
-
-    # 1. Nhắc nhở 08:30
+    
+    # 1. 08:30 - Tag và nhắc daily standup
     if current_time_str == "08:30" and not state["step_830"]:
-        if dev_channel: 
-            await dev_channel.send("@everyone Daily mọi người ơi!")
+        if dev_channel:
+            reminder_msg = random.choice(DAILY_STANDUP_MESSAGES)
+            await dev_channel.send(f"@everyone {reminder_msg}")
+            await dev_channel.send(f"Dậy daily cái nào mọi người")
         state["step_830"] = True
         save_state(state)
 
-    # 2. Tag tên 09:00 (TAG THEO ROLE HỢP LỆ)
+    # 2. 09:00 - Nhắc mọi người nhắn daily vào nhóm
     elif current_time_str == "09:00" and not state["step_900"]:
+        if dev_channel:
+            report_reminder = random.choice(DAILY_REPORT_MESSAGES)
+            await dev_channel.send(f"@everyone {report_reminder}")
+        state["step_900"] = True
+        save_state(state)
+
+    # 3. 09:30 - Nhắc lại những người chưa daily
+    elif current_time_str == "09:30" and not state["step_930"]:
         if dev_channel:
             _, reported_ids = await get_report_data_sorted()
             missing_mentions = []
@@ -236,23 +276,23 @@ async def daily_scheduler():
                     missing_mentions.append(member.mention)
             
             if missing_mentions:
-                await dev_channel.send(f"{' '.join(missing_mentions)} Daily mọi người ơi!")
-                
-        state["step_900"] = True
+                reminder_msg = "Nốt đi nào các bạn -_-"
+                await dev_channel.send(f"{' '.join(missing_mentions)} {reminder_msg}")
+        state["step_930"] = True
         save_state(state)
 
-    # 3. Tổng hợp 09:30
-    elif current_time_str == "09:30" and not state["step_930"]:
+    # 4. 09:45 - Gửi báo cáo tổng hợp
+    elif current_time_str == "09:45" and not state["step_945"]:
         final_content = await create_final_content()
         if daily_channel:
             sent = await daily_channel.send(final_content)
             state["msg_id"] = sent.id
-            state["step_930"] = True
+            state["step_945"] = True
             save_state(state)
 
-    # 4. Update
-    is_update = (now.minute == 0 or now.minute == 30)
-    is_after = (now.hour > 9) or (now.hour == 9 and now.minute >= 30)
+    # 5. Update báo cáo (từ 09:45 trở đi, mỗi 30 phút)
+    is_update = (now.minute == 15 or now.minute == 45)
+    is_after = (now.hour > 9) or (now.hour == 9 and now.minute >= 45)
 
     if is_update and is_after:
         final_content = await create_final_content()
@@ -272,7 +312,7 @@ async def daily_scheduler():
             else:
                 sent = await daily_channel.send(final_content)
                 state["msg_id"] = sent.id
-                state["step_930"] = True
+                state["step_945"] = True
                 save_state(state)
 
 @bot.event
