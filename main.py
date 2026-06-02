@@ -7,23 +7,24 @@ import json
 import os
 import random
 from dotenv import load_dotenv
+import logging
 
 load_dotenv()
 
 # ================= CẤU HÌNH CHUNG =================
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-DEVELOPER_CHANNEL_ID = os.getenv("DEVELOPER_CHANNEL_ID")
-DAILY_CHANNEL_ID = os.getenv("DAILY_CHANNEL_ID")
+DEVELOPER_CHANNEL_ID = int(os.getenv("DEVELOPER_CHANNEL_ID"))
+DAILY_CHANNEL_ID = int(os.getenv("DAILY_CHANNEL_ID"))
 
 # --- CẤU HÌNH ROLE: LỌC VÀ SẮP XẾP ---
 # Điền ID các Role được phép báo cáo.
 # Thứ tự trong list này quyết định thứ tự hiển thị trong báo cáo tổng.
 REPORT_ROLE_ORDER = [
-    os.getenv("DEV_CV_ROLE_ID"),
-    os.getenv("DEV_LLM_ROLE_ID"),
-    os.getenv("DEV_FULLSTACK_ROLE_ID"),
-    os.getenv("BA_ROLE_ID"),
-    os.getenv("TESTER_ROLE_ID"),
+    int(os.getenv("DEV_CV_ROLE_ID")),
+    int(os.getenv("DEV_LLM_ROLE_ID")),
+    int(os.getenv("DEV_FULLSTACK_ROLE_ID")),
+    int(os.getenv("BA_ROLE_ID")),
+    int(os.getenv("TESTER_ROLE_ID")),
 ]
 
 # --- CẤU HÌNH THỨ 7 CÁCH TUẦN ---
@@ -31,13 +32,13 @@ ANCHOR_WORK_SATURDAY = os.getenv("ANCHOR_WORK_SATURDAY", "2026-05-16")
 
 # --- DANH SÁCH CÂU NHẮC RANDOM ---
 DAILY_STANDUP_MESSAGES = [
-    "Đến lúc bịa xem hôm qua đã làm gì",
+    "Đến lúc bịa xem hôm trước đã làm gì",
     "Đến giờ tổng hợp những gì 'đáng lẽ đã làm'",
-    "Đến giờ hợp thức hóa sự bận rộn hôm qua",
-    "Hôm qua làm gì không quan trọng, kể sao cho hợp lý mới quan trọng",
+    "Đến giờ hợp thức hóa sự bận rộn hôm trước",
+    "Hôm trước làm gì không quan trọng, kể sao cho hợp lý mới quan trọng",
     "SELECT * FROM team_status WHERE sleepy = true;",
     "Daily.exe is starting...",
-    "Đố nhớ hôm qua làm gì",
+    "Đố nhớ hôm trước làm gì",
     "Time to explain why task estimate was merely a suggestion",
     "Đến giờ giải thích vì sao task 2 tiếng kéo dài 2 ngày",
     "DAILY!",
@@ -46,7 +47,7 @@ DAILY_STANDUP_MESSAGES = [
 DAILY_REPORT_MESSAGES = [
     "Convert sang text đê mọi người",
     "Nhắn phát vào đây đê mọi người",
-    "DAILY!",
+    "DAILY VÀO ĐÂY ĐÊ!",
 ]
 
 # ================= HỆ THỐNG =================
@@ -207,18 +208,48 @@ async def get_report_data_sorted():
     
     return raw_reports, reported_ids
 
-async def create_final_content():
+async def create_final_contents_by_role():
     sorted_reports, _ = await get_report_data_sorted()
-    
-    # Chỉ lấy phần text để ghép lại
-    reports_text_list = [item['text'] for item in sorted_reports]
-    
+
     now = datetime.now(VN_TZ)
-    header = f"__**Daily Report {now.strftime('%d/%m/%Y')}:**__\n\n"
-    
-    if not reports_text_list:
-        return header + "(Hiện tại chưa có báo cáo nào)"
-    return header + "\n\n".join(reports_text_list)
+
+    role_names = {
+        0: "CV Dev",
+        1: "LLM Dev",
+        2: "Fullstack Dev",
+        3: "BA",
+        4: "Tester",
+    }
+
+    grouped = {}
+
+    for item in sorted_reports:
+        prio = item["prio"]
+
+        if prio not in grouped:
+            grouped[prio] = []
+
+        grouped[prio].append(item["text"])
+
+    results = []
+
+    # Header tổng
+    header = f"__**Daily Report {now.strftime('%d/%m/%Y')}:**__"
+
+    results.append(header)
+
+    for prio in sorted(grouped.keys()):
+        role_title = role_names.get(prio, f"Role {prio}")
+
+        content = f"## {role_title}\n\n"
+        content += "\n\n".join(grouped[prio])
+
+        results.append(content)
+
+    if len(results) == 1:
+        results.append("(Hiện tại chưa có báo cáo nào)")
+
+    return results
 
 # ================= SCHEDULER =================
 @tasks.loop(minutes=1)
@@ -283,10 +314,16 @@ async def daily_scheduler():
 
     # 4. 09:45 - Gửi báo cáo tổng hợp
     elif current_time_str == "09:45" and not state["step_945"]:
-        final_content = await create_final_content()
+        final_contents = await create_final_contents_by_role()
+
         if daily_channel:
-            sent = await daily_channel.send(final_content)
-            state["msg_id"] = sent.id
+            sent_messages = []
+
+            for content in final_contents:
+                sent = await daily_channel.send(content)
+                sent_messages.append(sent.id)
+
+            state["msg_ids"] = sent_messages
             state["step_945"] = True
             save_state(state)
 
@@ -295,25 +332,38 @@ async def daily_scheduler():
     is_after = (now.hour > 9) or (now.hour == 9 and now.minute >= 45)
 
     if is_update and is_after:
-        final_content = await create_final_content()
-        msg_id = state.get("msg_id")
+        final_contents = await create_final_contents_by_role()
+        msg_ids = state.get("msg_ids", [])
         
         if daily_channel:
-            if msg_id:
-                try:
-                    msg_edit = await daily_channel.fetch_message(msg_id)
-                    if msg_edit.content != final_content:
-                        await msg_edit.edit(content=final_content)
-                        print(f"[{current_time_str}] Đã cập nhật.")
-                except discord.NotFound:
-                    sent = await daily_channel.send(final_content)
-                    state["msg_id"] = sent.id
-                    save_state(state)
-            else:
-                sent = await daily_channel.send(final_content)
-                state["msg_id"] = sent.id
-                state["step_945"] = True
+            # Nếu số message thay đổi -> xóa hết gửi lại
+            if len(msg_ids) != len(final_contents):
+                for mid in msg_ids:
+                    try:
+                        msg = await daily_channel.fetch_message(mid)
+                        await msg.delete()
+                    except:
+                        pass
+
+                new_ids = []
+
+                for content in final_contents:
+                    sent = await daily_channel.send(content)
+                    new_ids.append(sent.id)
+
+                state["msg_ids"] = new_ids
                 save_state(state)
+
+            else:
+                for idx, content in enumerate(final_contents):
+                    try:
+                        msg = await daily_channel.fetch_message(msg_ids[idx])
+
+                        if msg.content != content:
+                            await msg.edit(content=content)
+
+                    except discord.NotFound:
+                        pass
 
 @bot.event
 async def on_ready():
